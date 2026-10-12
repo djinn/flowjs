@@ -354,7 +354,7 @@ void fjs_lexer_init(fjs_lexer *lx, const char *file, const char *src, size_t len
     .p = src,
     .ln = 1,
     .col = 1,
-    .prev_was_regex_ok = false,
+    .prev_was_regex_ok = true,
     .err = FJS_ERROR_OK,
     .tok = {.kind = FJS_TK_INVALID},
   };

@@ -253,8 +253,19 @@ static fjs_ast *parse_stmt(fjs_parser *p) {
   }
   if (match_kw(p, FJS_KW_IMPORT)) {
     fjs_ast *n = pos(p, AST_IMPORT_DECL, &t);
-    fjs_token str = consume(p);
-    if (str.kind == FJS_TK_STRING) {
+    if (peek_kind(p) == FJS_TK_IDENT) {
+      fjs_token id_tok = consume(p);
+      fjs_ast *ident = mkident(p, id_tok.txt);
+      if (match_kw(p, FJS_KW_FROM)) {
+        fjs_token str = consume(p);
+        fjs_ast *s = pos(p, AST_STRING_LITERAL, &str);
+        if (s) { s->txt = str.value.len ? str.value : str.txt; n->a = ident; n->b = s; }
+        return n;
+      }
+      return n;
+    }
+    if (peek_kind(p) == FJS_TK_STRING) {
+      fjs_token str = consume(p);
       fjs_ast *s = pos(p, AST_STRING_LITERAL, &str);
       if (s) { s->txt = str.value.len ? str.value : str.txt; n->a = s; }
     }
@@ -274,6 +285,13 @@ static fjs_ast *parse_stmt(fjs_parser *p) {
     p->had_lookahead = saved_had; p->lookahead = save_la;
     p->lx.p = p->lx.src + save_p; p->lx.ln = save_ln; p->lx.col = save_col;
   }
+ /* Regular expression as statement */
+ if (peek_kind(p) == FJS_TK_REGEX) {
+    fjs_ast *n = pos(p, AST_EXPR_STMT, &t);
+    consume(p);
+    if (n) n->a = pos(p, AST_REGEX_LITERAL, &t);
+    return n;
+ }
   /* async function decl */
   if (peek_kind(p) == FJS_TK_KW && t.kw == FJS_KW_ASYNC) {
     consume(p);
@@ -369,6 +387,49 @@ static fjs_ast *parse_primary(fjs_parser *p) {
     if (t.kw == FJS_KW_NULL) return pos(p, AST_NULL_LITERAL, &t);
     if (t.kw == FJS_KW_FN) return parse_fn(p, &t);
     if (t.kw == FJS_KW_CLASS) { fjs_ast *c = parse_class(p, &t); if(c) c->kind = AST_CLASS_EXPR; return c; }
+    if (t.kw == FJS_KW_NEW) {
+      fjs_ast *n = pos(p, AST_NEW_EXPR, &t);
+      if (n) {
+        n->a = parse_primary(p);
+        if (peek_kind(p) == FJS_TK_LPAREN) {
+          consume(p);
+          while (peek_kind(p) != FJS_TK_RPAREN && peek_kind(p) != FJS_TK_EOF) {
+            fjs_ast *arg = parse_expr(p);
+            if (arg) fjs_list_push(&p->b, &n->list, arg);
+            if (peek_kind(p) != FJS_TK_RPAREN) expect(p, FJS_TK_COMMA);
+          }
+          expect(p, FJS_TK_RPAREN);
+        }
+      }
+      return n;
+    }
+    if (t.kw == FJS_KW_ASYNC) {
+      if (peek_kind(p) == FJS_TK_LPAREN || peek_kind(p) == FJS_TK_IDENT) {
+        fjs_ast *arrow_n = fjs_make_ast(&p->b, AST_ARROW_FN);
+        if (!arrow_n) return NULL;
+        arrow_n->flag = true;
+        if (peek_kind(p) == FJS_TK_LPAREN) {
+          consume(p);
+          while (peek_kind(p) != FJS_TK_RPAREN && peek_kind(p) != FJS_TK_EOF) {
+            fjs_ast *param = mkident(p, consume(p).txt);
+            if (match(p, FJS_TK_ASSIGN)) {
+              fjs_ast *a = pos(p, AST_ASSIGN_PATTERN, &p->lookahead);
+              if (a) { a->a = param; a->b = parse_expr(p); param = a; }
+            }
+            fjs_list_push(&p->b, &arrow_n->list, param);
+            if (peek_kind(p) != FJS_TK_RPAREN) expect(p, FJS_TK_COMMA);
+          }
+          expect(p, FJS_TK_RPAREN);
+        } else {
+          fjs_list_push(&p->b, &arrow_n->list, mkident(p, consume(p).txt));
+        }
+        expect(p, FJS_TK_ARROW);
+        if (peek_kind(p) == FJS_TK_LBRACE) { arrow_n->a = parse_block(p); }
+        else { arrow_n->flag = true; arrow_n->a = parse_expr(p); }
+        return arrow_n;
+      }
+      return mkident(p, (fjs_slice){"async", 5});
+    }
     fjs_lexer_error(&p->lx, "unexpected keyword in expression"); return NULL;
   }
   if (t.kind == FJS_TK_NUM) {
@@ -627,7 +688,13 @@ static fjs_ast *parse_expr(fjs_parser *p) {
         break;
       }
       fjs_token param = consume(p);
-      fjs_list_push(&p->b, &params, mkident(p, param.txt));
+      fjs_ast *pnode = mkident(p, param.txt);
+      if (peek_kind(p) == FJS_TK_ASSIGN) {
+        consume(p);
+        fjs_ast *a = fjs_make_ast(&p->b, AST_ASSIGN_PATTERN);
+        if (a) { a->a = pnode; a->b = parse_expr(p); pnode = a; }
+      }
+      fjs_list_push(&p->b, &params, pnode);
       if (peek_kind(p) != FJS_TK_RPAREN) expect(p, FJS_TK_COMMA);
     }
     if (peek_kind(p) == FJS_TK_RPAREN) {
@@ -780,6 +847,33 @@ static fjs_ast *parse_obj(fjs_parser *p, fjs_token *brace) {
       if (peek_kind(p) != FJS_TK_RBRACE) expect(p, FJS_TK_COMMA);
       continue;
     }
+    /* async method */
+    if (kk == FJS_TK_KW && peek(p).kw == FJS_KW_ASYNC) {
+      consume(p);
+      if (peek_kind(p) == FJS_TK_IDENT) {
+        fjs_token aname = consume(p);
+        fjs_ast *prop = fjs_make_ast(&p->b, AST_PROPERTY);
+        if (prop) { prop->txt = (fjs_slice){"init",4};
+          prop->a = mkident(p, aname.txt);
+          fjs_ast *am = pos(p, AST_FN_EXPR, &aname);
+          if (am) { am->txt = aname.txt; am->flag = true;
+            if (peek_kind(p) == FJS_TK_LPAREN) {
+              expect(p, FJS_TK_LPAREN);
+              while (peek_kind(p) != FJS_TK_RPAREN && peek_kind(p) != FJS_TK_EOF) {
+                fjs_list_push(&p->b, &am->list, mkident(p, consume(p).txt));
+                if (peek_kind(p) != FJS_TK_RPAREN) expect(p, FJS_TK_COMMA);
+              }
+              expect(p, FJS_TK_RPAREN);
+            }
+            if (peek_kind(p) == FJS_TK_LBRACE) { am->a = parse_block(p); }
+            prop->b = am;
+          }
+          fjs_list_push(&p->b, &n->list, prop);
+        }
+      } else { fjs_lexer_error(&p->lx, "expected method name after async"); return n; }
+      if (peek_kind(p) != FJS_TK_RBRACE) expect(p, FJS_TK_COMMA);
+      continue;
+    }
     /* Keyword keys: { if: 42, true: false } */
     if (kk == FJS_TK_KW) {
       fjs_token kw_tok = consume(p);
@@ -811,6 +905,7 @@ static fjs_ast *parse_obj(fjs_parser *p, fjs_token *brace) {
       if (peek_kind(p) != FJS_TK_RBRACE) expect(p, FJS_TK_COMMA);
       continue;
     }
+    
     /* get/set */
     if (kk == FJS_TK_KW && (peek(p).kw == FJS_KW_GET || peek(p).kw == FJS_KW_SET)) {
       fjs_token gs = consume(p); fjs_token key = consume(p);
