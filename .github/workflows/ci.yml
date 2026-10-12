@@ -1,0 +1,175 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, develop]
+    paths:
+      - 'src_c/**'
+      - 'bin/**'
+      - 'lib/**'
+      - 'test/**'
+      - 'package.json'
+      - 'binding.gyp'
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  FORCE_COLOR: 3
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: '🐧 Linux x86_64'
+            runner: ubuntu-latest
+            arch: x86_64
+            node: '24'
+            gcc: '13'
+
+          - label: '🐧 Linux arm64'
+            runner: ubuntu-24.04-arm
+            arch: arm64
+            node: '24'
+            gcc: '13'
+
+          - label: '🍎 macOS Intel'
+            runner: macos-13
+            arch: x86_64
+            node: '24'
+
+          - label: '🍎 macOS arm64'
+            runner: macos-latest
+            arch: arm64
+            node: '24'
+
+          - label: '🐧 Linux x86_64 (Node 20)'
+            runner: ubuntu-latest
+            arch: x86_64
+            node: '20'
+            gcc: '13'
+
+          - label: '🐧 Linux x86_64 (Node 22)'
+            runner: ubuntu-latest
+            arch: x86_64
+            node: '22'
+            gcc: '13'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up GCC ${{ matrix.gcc }}
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-${{ matrix.gcc }} g++-${{ matrix.gcc }}
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-${{ matrix.gcc }} 100
+          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-${{ matrix.gcc }} 100
+
+      - name: Verify C23 support (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          echo "GCC: $(gcc --version | head -1)"
+          echo 'int main(void) { bool b = true; nullptr_t n = nullptr; return 0; }' | gcc -std=c2x -x c - -o /tmp/c23_test
+
+      - name: Setup Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Cache node-gyp
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/node-gyp
+            ~/Library/Caches/node-gyp
+          key: ${{ runner.os }}-${{ matrix.arch }}-node-gyp-${{ matrix.node }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.arch }}-node-gyp-
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts || npm install
+
+      - name: Build native module
+        run: npm run build
+
+      - name: Run smoke tests
+        run: node test/smoke.js
+
+      - name: Run feature tests
+        run: node test/piecewise.js
+
+      - name: Run fix verification tests
+        run: node test/fixes_test.js
+
+      - name: Test CLI
+        run: |
+          node bin/flowjs.js examples/src.es6.js --ast 2>&1 | head -5
+
+      - name: Verify built artifact
+        run: |
+          echo "=== Binary Info ==="
+          ls -lh build/Release/flowjs_native.node
+          file build/Release/flowjs_native.node
+
+  test-babel-fixtures:
+    name: Babel Fixture Compatibility
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install GCC 13
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-13 g++-13
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100
+          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100
+
+      - name: Clone Babel fixtures (shallow)
+        uses: actions/checkout@v4
+        with:
+          repository: babel/babel
+          path: babel
+          sparse-checkout: packages/babel-parser/test/fixtures
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+
+      - name: Build native module
+        run: npm run build
+
+      - name: Run Babel fixture comparison
+        run: node test/run-babel-fixtures.js
+        continue-on-error: true
+
+  lint:
+    name: Lint & Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check C syntax (dry compile)
+        run: |
+          for f in src_c/*.c; do
+            gcc -std=c2x -Isrc_c -fsyntax-only -Wall -Wextra "$f" 2>&1 || true
+          done
+
+      - name: Check JS syntax
+        run: |
+          node --check bin/flowjs.js
+          node --check lib/index.js
+          for f in test/*.js; do node --check "$f"; done

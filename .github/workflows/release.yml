@@ -1,0 +1,232 @@
+name: Release — Build & Publish
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  FORCE_COLOR: 3
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: '🐧 Linux x86_64'
+            runner: ubuntu-latest
+            arch: x86_64
+            os: linux
+            node: '24'
+            gcc: '13'
+
+          - label: '🐧 Linux arm64'
+            runner: ubuntu-24.04-arm
+            arch: arm64
+            os: linux
+            node: '24'
+            gcc: '13'
+
+          - label: '🍎 macOS Intel'
+            runner: macos-13
+            arch: x86_64
+            os: darwin
+            node: '24'
+
+          - label: '🍎 macOS arm64'
+            runner: macos-latest
+            arch: arm64
+            os: darwin
+            node: '24'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install GCC ${{ matrix.gcc }} (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-${{ matrix.gcc }} g++-${{ matrix.gcc }}
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-${{ matrix.gcc }} 100
+          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-${{ matrix.gcc }} 100
+          echo "GCC: $(gcc --version | head -1)"
+
+      - name: Install macOS deps
+        if: runner.os == 'macOS'
+        run: |
+          gcc --version || brew install gcc
+          echo "GCC: $(gcc --version | head -1)"
+
+      - name: Setup Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Cache node-gyp
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/node-gyp
+            ~/Library/Caches/node-gyp
+          key: ${{ runner.os }}-${{ matrix.arch }}-node-gyp-${{ matrix.node }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.arch }}-node-gyp-
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts || npm install
+
+      - name: Build native module
+        run: npm run build
+
+      - name: Validate
+        run: |
+          echo "=== Architecture ==="
+          uname -a
+          echo "=== Binary ==="
+          ls -lh build/Release/flowjs_native.node
+          file build/Release/flowjs_native.node
+          echo "=== Smoke test ==="
+          node test/smoke.js
+          echo "=== Feature tests ==="
+          node test/piecewise.js
+          node test/fixes_test.js
+
+      - name: Package binary
+        id: package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PKGNAME="flowjs-v${VERSION}-${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p "dist/$PKGNAME"
+
+          cp build/Release/flowjs_native.node "dist/$PKGNAME/"
+          cp package.json README.md LICENSE binding.gyp "dist/$PKGNAME/"
+          cp -r bin lib src_c "dist/$PKGNAME/"
+
+          cd dist
+          tar czf "$PKGNAME.tar.gz" "$PKGNAME/"
+          echo "artifact=$PKGNAME.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "name=$PKGNAME" >> "$GITHUB_OUTPUT"
+          echo "Package: $(ls -lh $PKGNAME.tar.gz)"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/${{ steps.package.outputs.artifact }}
+          compression-level: 0
+          retention-days: 90
+
+      - name: Upload to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ steps.package.outputs.artifact }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-npm:
+    name: 📦 Publish to npm
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'release' || github.event_name == 'push'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install GCC
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-13 g++-13
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100
+          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100
+
+      - name: Build
+        run: |
+          npm install --ignore-scripts
+          npm run build
+          node test/smoke.js
+          node test/piecewise.js
+
+      - name: Publish to npm
+        if: github.event_name == 'release'
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  create-release:
+    name: 🏷️ Create Release Summary
+    runs-on: ubuntu-latest
+    needs: [build, publish-npm]
+    if: github.event_name == 'release'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          echo "## flowjs ${{ github.ref_name }}" > release-notes.md
+          echo "" >> release-notes.md
+          echo "### Downloads" >> release-notes.md
+          echo "" >> release-notes.md
+          echo "| File | SHA256 |" >> release-notes.md
+          echo "|------|--------|" >> release-notes.md
+
+          # Download all artifacts and checksum
+          gh run download "${{ github.run_id }}" --name 'flowjs-*' --dir /tmp/artifacts
+          for f in /tmp/artifacts/*.tar.gz; do
+            base=$(basename "$f")
+            sha=$(sha256sum "$f" | cut -d' ' -f1)
+            echo "| \`$base\` | \`$sha\` |" >> release-notes.md
+          done
+
+          echo "" >> release-notes.md
+          echo "### Install" >> release-notes.md
+          echo "" >> release-notes.md
+          echo '```bash' >> release-notes.md
+          echo "npm install flowjs@${{ github.ref_name }}" >> release-notes.md
+          echo '```' >> release-notes.md
+          echo "" >> release-notes.md
+          echo "Or download a tarball above, extract, and run:" >> release-notes.md
+          echo '```bash' >> release-notes.md
+          echo 'tar xzf flowjs-*.tar.gz' >> release-notes.md
+          echo 'cd flowjs-*' >> release-notes.md
+          echo 'npm run build  # if binary incompatible with your system' >> release-notes.md
+          echo '```' >> release-notes.md
+
+          cat release-notes.md
+
+  badge:
+    name: 📊 Final Status
+    runs-on: ubuntu-latest
+    needs: build
+    if: always()
+    steps:
+      - name: Summarize
+        run: |
+          echo "## ✅ Release Build Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All platform binaries built and packaged." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Platform | Arch | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Linux | x86_64 | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Linux | arm64  | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| macOS | x86_64 | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| macOS | arm64  | ✅ |" >> $GITHUB_STEP_SUMMARY

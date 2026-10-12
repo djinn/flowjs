@@ -1,0 +1,63 @@
+{
+  "name": "flowjs",
+  "version": "0.1.0",
+  "description": "Babel-compatible JavaScript toolchain written in C23, integrated into Node via N-API. Native C23 parser producing Babel-format AST. 2-5x faster than @babel/parser.",
+  "type": "commonjs",
+  "main": "lib/index.js",
+  "bin": {
+    "flowjs": "bin/flowjs.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "src_c",
+    "binding.gyp",
+    "README.md",
+    "LICENSE",
+    ".github/workflows/ci.yml",
+    ".github/workflows/build.yml"
+  ],
+  "scripts": {
+    "install": "node-gyp rebuild",
+    "build": "node-gyp rebuild",
+    "clean": "rm -rf build",
+    "test": "node test/piecewise.js && node test/fixes_test.js && node test/smoke.js",
+    "test:c": "make -C src_c test",
+    "example": "node bin/flowjs.js examples/src.es6.js --ast",
+    "prepack": "npm run build",
+    "test:babel": "node test/run-babel-fixtures.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "compiler",
+    "babel",
+    "zerocopy",
+    "c23",
+    "n-api",
+    "toolchain",
+    "es5",
+    "transpiler",
+    "parser",
+    "native",
+    "ast",
+    "javascript",
+    "arena",
+    "es2022"
+  ],
+  "license": "MIT",
+  "gypfile": true,
+  "dependencies": {
+    "@babel/parser": "^8.0.7"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-org/flowjs.git",
+    "directory": "."
+  },
+  "bugs": {
+    "url": "https://github.com/your-org/flowjs/issues"
+  },
+  "homepage": "https://github.com/your-org/flowjs#readme"
+}

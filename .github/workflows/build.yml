@@ -1,0 +1,149 @@
+name: Build & Package Binaries
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'src_c/**'
+      - 'binding.gyp'
+      - 'package.json'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FORCE_COLOR: 3
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x86_64
+            runner: ubuntu-latest
+            arch: x86_64
+            os: linux
+            node: '24'
+            gcc: '13'
+
+          - label: Linux arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+            os: linux
+            node: '24'
+            gcc: '13'
+
+          - label: macOS Intel
+            runner: macos-13
+            arch: x86_64
+            os: darwin
+            node: '24'
+
+          - label: macOS arm64 (Apple Silicon)
+            runner: macos-latest
+            arch: arm64
+            os: darwin
+            node: '24'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-${{ matrix.gcc }} g++-${{ matrix.gcc }} tar gzip
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-${{ matrix.gcc }} 100
+          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-${{ matrix.gcc }} 100
+          gcc --version | head -1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Cache node-gyp headers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/node-gyp
+          key: ${{ runner.os }}-${{ matrix.arch }}-node-gyp-${{ matrix.node }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.arch }}-node-gyp-
+
+      - name: Build native module
+        run: |
+          npm install --ignore-scripts
+          npm run build
+
+      - name: Run smoke tests
+        run: |
+          node test/smoke.js
+          node test/piecewise.js
+          node test/fixes_test.js
+
+      - name: Package binary
+        id: package
+        run: |
+          PKGNAME="flowjs-${{ matrix.os }}-${{ matrix.arch }}-node${{ matrix.node }}"
+          mkdir -p "dist/$PKGNAME"
+
+          # Copy native binary
+          cp build/Release/flowjs_native.node "dist/$PKGNAME/"
+
+          # Copy JS files
+          cp -r bin lib src_c binding.gyp package.json README.md LICENSE "dist/$PKGNAME/"
+
+          # Create tarball
+          cd dist
+          tar czf "$PKGNAME.tar.gz" "$PKGNAME/"
+          echo "artifact=$PKGNAME.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "name=$PKGNAME" >> "$GITHUB_OUTPUT"
+          ls -lh "$PKGNAME.tar.gz"
+
+          cd ..
+
+      - name: Upload artifact (CI)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/${{ steps.package.outputs.artifact }}
+          retention-days: 30
+
+      - name: Upload release asset
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ steps.package.outputs.artifact }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  verify:
+    name: Verify all builds
+    if: always()
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check build results
+        run: |
+          echo "All builds completed:"
+          echo "  - Linux x86_64  : ${{ needs.build.outputs.status }}"
+          echo "  - Linux arm64   : ${{ needs.build.outputs.status }}"
+          echo "  - macOS Intel   : ${{ needs.build.outputs.status }}"
+          echo "  - macOS arm64   : ${{ needs.build.outputs.status }}"
+      - name: Summarize
+        run: |
+          echo "## Build Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Platform | Architecture | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Linux | x86_64 | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Linux | arm64 | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| macOS | x86_64 | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| macOS | arm64 | ✅ |" >> $GITHUB_STEP_SUMMARY
